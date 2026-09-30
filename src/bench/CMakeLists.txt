@@ -47,6 +47,7 @@ add_executable(bench_bitcoin
   sign_transaction.cpp
   streams_findbyte.cpp
   strencodings.cpp
+  unused_data.cpp
   util_time.cpp
   verify_script.cpp
   xor.cpp

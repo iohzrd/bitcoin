@@ -39,6 +39,7 @@
 #include <policy/rbf.h>
 #include <policy/settings.h>
 #include <policy/truc_policy.h>
+#include <policy/unused_data.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -721,6 +722,9 @@ private:
          * transactions (which may include its ancestors and/or descendants). */
         CFeeRate m_package_feerate{0};
 
+        /** DatacarrierBytes of the transaction, which PolicyScriptChecks adds unused input data to. */
+        std::pair<size_t, size_t> m_datacarrier_bytes{0, 0};
+
         const CTransactionRef& m_ptx;
         /** Txid. */
         const Txid& m_hash;
@@ -1062,6 +1066,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     if (m_pool.m_opts.datacarrier_fullcount || !m_pool.m_opts.accept_non_std_datacarrier) {
         const auto dcb = DatacarrierBytes(tx, m_view);
+        ws.m_datacarrier_bytes = dcb;
         if (dcb.second > 0 && !(m_pool.m_opts.accept_non_std_datacarrier || ignore_rejects.count("txn-datacarrier-nonstandard"))) {
             return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "txn-datacarrier-nonstandard");
         }
@@ -1556,6 +1561,31 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
                     state.GetRejectReason(), state.GetDebugMessage());
         }
         return false; // state filled in by CheckInputScripts
+    }
+
+    // Which input bytes a spend could do without takes the executed scripts, so it follows their
+    // validation, with the signatures that validated them in the cache.
+    if (m_pool.m_opts.datacarrier_fullcount || !m_pool.m_opts.accept_non_std_datacarrier) {
+        auto dcb{ws.m_datacarrier_bytes};
+        for (unsigned int i{0}; i < tx.vin.size(); ++i) {
+            const CTxOut& prevout{m_view.AccessCoin(tx.vin[i].prevout).out};
+            const auto [script, weight] = GetScriptForTransactionInput(prevout.scriptPubKey, tx.vin[i]);
+            std::vector<std::pair<size_t, size_t>> counted_ranges;
+            (void)script.DatacarrierBytes(0, &tx.vin[i].scriptWitness, &counted_ranges);
+            const CachingTransactionSignatureChecker checker{&tx, i, prevout.nValue, /*storeIn=*/true,
+                                                            GetValidationCache().m_signature_cache, ws.m_precomputed_txdata};
+            if (const auto unused{UnusedInputDataBytes(tx.vin[i], prevout.scriptPubKey, scriptVerifyFlags, checker, counted_ranges)}) {
+                dcb.first += unused->first;
+                dcb.second += unused->second;
+            }
+        }
+        const auto& ignore_rejects{args.m_ignore_rejects};
+        if (dcb.second > 0 && !(m_pool.m_opts.accept_non_std_datacarrier || ignore_rejects.count("txn-datacarrier-nonstandard"))) {
+            return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "txn-datacarrier-nonstandard");
+        }
+        if (m_pool.m_opts.datacarrier_fullcount && (!ignore_rejects.count("txn-datacarrier-exceeded")) && dcb.first + dcb.second > m_pool.m_opts.max_datacarrier_bytes.value_or(0)) {
+            return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "txn-datacarrier-exceeded");
+        }
     }
 
     return true;

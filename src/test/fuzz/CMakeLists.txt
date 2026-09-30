@@ -126,6 +126,7 @@ add_executable(fuzz
   tx_pool.cpp
   txorphan.cpp
   txrequest.cpp
+  unused_data.cpp
   # Visual Studio 2022 version 17.12 introduced a bug
   # that causes an internal compiler error.
   # See: https://github.com/bitcoin/bitcoin/issues/31303

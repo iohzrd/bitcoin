@@ -579,7 +579,12 @@ public:
 
     size_t OPNetWitnessSize(const CScriptWitness& witness) const;
     size_t IsOLGA(size_t remaining_outputs) const;
-    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr) const;
+    /**
+     * Returns {datacarrier bytes, datacarrier bytes that are rejected unless -acceptnonstddatacarrier}.
+     * If counted_ranges is set, appends each [begin, end) script offset range of the second count.
+     */
+    std::pair<size_t, size_t> DatacarrierBytes(size_t remaining_outputs, const CScriptWitness* witness = nullptr,
+                                               std::vector<std::pair<size_t, size_t>>* counted_ranges = nullptr) const;
 
     void clear()
     {

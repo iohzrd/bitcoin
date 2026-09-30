@@ -356,14 +356,22 @@ size_t CScript::OPNetWitnessSize(const CScriptWitness& witness) const
     return stack[0].size() + stack[3].size() - deduct;
 }
 
-std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness) const
+std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outputs, const CScriptWitness* witness,
+                                                   std::vector<std::pair<size_t, size_t>>* counted_ranges) const
 {
+    const auto count_range = [&](size_t range_begin, size_t range_end) {
+        if (counted_ranges) counted_ranges->emplace_back(range_begin, range_end);
+        return range_end - range_begin;
+    };
+
     if (size_t olga_bytes = IsOLGA(remaining_outputs); olga_bytes) {
+        count_range(0, size());
         return {0, olga_bytes};
     }
 
     if (witness) {
         if (uint32_t opnet_bytes = OPNetWitnessSize(*witness); opnet_bytes) {
+            count_range(0, size());
             return {0, opnet_bytes};
         }
     }
@@ -377,13 +385,13 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
         opcode_it = it;
         if (!GetOp(it, opcode, push_data)) {
             // Invalid scripts are necessarily all data
-            return {0, size()};
+            return {0, count_range(0, size())};
         }
 
         if (opcode == OP_IF || opcode == OP_NOTIF) {
             ++inside_conditional;
         } else if (opcode == OP_ENDIF) {
-            if (!inside_conditional) return {0, size()};  // invalid
+            if (!inside_conditional) return {0, count_range(0, size())};  // invalid
             --inside_conditional;
         } else if (opcode == OP_RETURN && !inside_conditional) {
             // unconditional OP_RETURN is unspendable
@@ -398,7 +406,8 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
                 break;
             case OP_ENDIF:
                 if (0 == --inside_noop) {
-                    counted += it - data_began + 1;
+                    // The range starts at the OP_FALSE before data_began.
+                    counted += count_range(data_began - begin() - 1, it - begin());
                 }
                 break;
             default: /* do nothing */;
@@ -410,7 +419,7 @@ std::pair<size_t, size_t> CScript::DatacarrierBytes(const size_t remaining_outpu
         } else if (opcode <= OP_PUSHDATA4) {
             data_began = opcode_it;
         } else if (opcode == OP_DROP && last_opcode <= OP_PUSHDATA4) {
-            counted += it - data_began;
+            counted += count_range(data_began - begin(), it - begin());
         }
     }
     return {0, counted};
