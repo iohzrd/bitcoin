@@ -18,8 +18,10 @@
 
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 using util::SplitString;
@@ -99,6 +101,26 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
             throw std::runtime_error("-blake2b_headline requires -testactivationheight=blake2b@<height>");
         }
         options.blake2b_headline.emplace(arg->begin(), arg->end());
+    }
+
+    for (const auto& [name, field, lo, hi] : std::initializer_list<std::tuple<const char*, int, int64_t, int64_t>>{
+             {"-ddpowreads", 0, 1, 16},
+             {"-ddpowpartners", 1, 0, 16},
+             {"-ddpowblockbits", 2, 1, 64}}) {
+        const auto arg{args.GetArg(name, "")};
+        if (arg.empty()) continue;
+        if (!options.activation_heights.contains(Consensus::BuriedDeployment::DEPLOYMENT_DDPOW)) {
+            throw std::runtime_error(strprintf("%s requires -testactivationheight=ddpow@<height>", name));
+        }
+        int64_t value;
+        if (!ParseInt64(arg, &value) || value < lo || value > hi) {
+            throw std::runtime_error(strprintf("Invalid value (%s) for %s: must be %d..%d", arg, name, lo, hi));
+        }
+        switch (field) {
+        case 0: options.ddpow_reads = uint8_t(value); break;
+        case 1: options.ddpow_partners = uint8_t(value); break;
+        default: options.ddpow_block_bits = uint8_t(value); break;
+        }
     }
 
     if (const auto arg{args.GetArg("-testcoinbasematuritylong")}; arg) {

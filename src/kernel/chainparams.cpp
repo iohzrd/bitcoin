@@ -656,6 +656,9 @@ public:
             case Consensus::BuriedDeployment::DEPLOYMENT_BLAKE2B:
                 consensus.Blake2bHeight = int{height};
                 break;
+            case Consensus::BuriedDeployment::DEPLOYMENT_DDPOW:
+                consensus.DdpowHeight = int{height};
+                break;
             case Consensus::BuriedDeployment::DEPLOYMENT_SEGWIT:
                 consensus.SegwitHeight = int{height};
                 break;
@@ -677,6 +680,10 @@ public:
         if (opts.blake2b_headline) {
             consensus.Blake2bHeadline = *opts.blake2b_headline;
         }
+
+        if (opts.ddpow_reads) consensus.DdpowReads = *opts.ddpow_reads;
+        if (opts.ddpow_partners) consensus.DdpowPartners = *opts.ddpow_partners;
+        if (opts.ddpow_block_bits) consensus.DdpowBlockBits = *opts.ddpow_block_bits;
 
         // Optionally schedule the RDTS deployment (see -rdtsexpiry). RDTS
         // activates at the BLAKE2b fork height scheduled above; only the

@@ -34,6 +34,12 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
 {
     unsigned int nProofOfWorkLimit = UintToArith256(params.powLimit).GetCompact();
 
+    if (params.DdpowBlockBits && params.IsDdpowHeight(pindexLast->nHeight + 1)) {
+        arith_uint256 target{~arith_uint256{}};
+        target >>= params.DdpowBlockBits;
+        return target.GetCompact();
+    }
+
     unsigned int nBits;
 
     // Only change once per difficulty adjustment interval

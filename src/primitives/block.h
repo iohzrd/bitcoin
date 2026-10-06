@@ -166,6 +166,16 @@ public:
     }
 
     uint256 GetHash() const;
+
+    /** The BLAKE2b stages of a v2 header's hash: the stage-3 digest the hashing hardware
+     *  produces (`hash2`) and the XOR mask the block hash applies to it. v2 headers only. */
+    struct PowStages {
+        uint256 hash2;
+        uint256 mask;
+    };
+    PowStages GetPowStages() const;
+    /** `digest` XOR `mask`, byte reversed: how a block hash is made from `hash2`. */
+    static uint256 MaskAndReverse(const uint256& digest, const uint256& mask);
 };
 
 

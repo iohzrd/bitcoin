@@ -13,12 +13,15 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
+#include <common/args.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <ddpow.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <interfaces/mining.h>
+#include <hash.h>
 #include <key_io.h>
 #include <net.h>
 #include <node/context.h>
@@ -36,6 +39,9 @@
 #include <script/signingprovider.h>
 #include <txmempool.h>
 #include <univalue.h>
+
+#include <chrono>
+#include <optional>
 #include <util/check.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
@@ -135,14 +141,44 @@ static RPCHelpMan getnetworkhashps()
     };
 }
 
+/** With -ddpowpackedstore: the node's packed store brought to the chain the node's ddpow state
+ *  follows (packing blocks it lacks), as a snapshot for walks outside cs_main; else nullptr. */
+static std::shared_ptr<ddpow::PackedStore> DdpowStoreSnapshot(const Consensus::Params& consensus) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    if (!gArgs.GetBoolArg("-ddpowpackedstore", false)) return nullptr;
+    ddpow::PackedStore& store{ddpow::NodePackedStore()};
+    if (!store.Open(gArgs.GetDataDirNet() / "ddpow_packed.dat")) throw JSONRPCError(RPC_MISC_ERROR, "The packed store cannot be opened");
+    if (!store.SyncTo(ddpow::NodeState().Reader(), consensus.DdpowPartners)) throw JSONRPCError(RPC_MISC_ERROR, "Packing into the packed store failed");
+    return store.Snapshot();
+}
+
 static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t& max_tries, std::shared_ptr<const CBlock>& block_out, bool process_new_block)
 {
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
 
-    while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
-        ++block.nNonce;
-        --max_tries;
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (block.m_header_v2 && consensus.IsDdpowHeight(block.m_height)) {
+        // The node's own walk: reads from its block files, outside cs_main.
+        std::optional<ddpow::Stage> stage;
+        {
+            LOCK(cs_main);
+            ddpow::State& dd{ddpow::NodeState()};
+            if (!dd.SyncTo(chainman.m_blockman, chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock))) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Block data for the data-dependent proof of work is unavailable");
+            }
+            stage = dd.Freeze(consensus);
+            stage->packed = DdpowStoreSnapshot(consensus);
+        }
+        while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !ddpow::Valid(block, *stage, consensus) && !chainman.m_interrupt) {
+            ++block.nNonce;
+            --max_tries;
+        }
+    } else {
+        while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, consensus) && !chainman.m_interrupt) {
+            ++block.nNonce;
+            --max_tries;
+        }
     }
     if (max_tries == 0 || chainman.m_interrupt) {
         return false;
@@ -1240,9 +1276,284 @@ static RPCHelpMan submitheader()
     };
 }
 
+/** The walk state for blocks built on `prev_hash`; throws if the block is unknown or a block's
+ *  data is unavailable. */
+static ddpow::Stage DdpowStageOn(ChainstateManager& chainman, const uint256& prev_hash, const CBlockIndex** prev_out = nullptr, bool use_store = false)
+{
+    LOCK(cs_main);
+    const CBlockIndex* prev{chainman.m_blockman.LookupBlockIndex(prev_hash)};
+    if (!prev) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+    if (!ddpow::NodeState().SyncTo(chainman.m_blockman, prev)) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Block data for the data-dependent proof of work is unavailable");
+    }
+    if (prev_out) *prev_out = prev;
+    ddpow::Stage stage{ddpow::NodeState().Freeze(chainman.GetConsensus())};
+    if (use_store) {
+        stage.packed = DdpowStoreSnapshot(chainman.GetConsensus());
+        if (!stage.packed) throw JSONRPCError(RPC_MISC_ERROR, "The packed store is off (-ddpowpackedstore)");
+    }
+    return stage;
+}
+
+static unsigned DdpowPartnersArg(const ChainstateManager& chainman, const UniValue& param)
+{
+    if (param.isNull()) return chainman.GetConsensus().DdpowPartners;
+    const int m{param.getInt<int>()};
+    if (m < 0 || m > 64) throw JSONRPCError(RPC_INVALID_PARAMETER, "partners must be 0..64");
+    return unsigned(m);
+}
+
+static UniValue HexOf(const ddpow::Chunk& c) { return HexStr(c); }
+
+static RPCHelpMan getddpowchunk()
+{
+    return RPCHelpMan{"getddpowchunk",
+        "\nA chunk of the data-dependent proof of work's chunk space of blocks built on a block (its ancestors and itself): "
+        "the raw chunk, its partners and its packed form.\n",
+        {
+            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the last block of the space"},
+            {"position", RPCArg::Type::NUM, RPCArg::Optional::NO, "chunk position"},
+            {"partners", RPCArg::Type::NUM, RPCArg::DefaultHint{"the consensus value"}, "partner count"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "count", "chunks of the space"},
+            {RPCResult::Type::NUM, "parent_start", "chunks before the space's last block"},
+            {RPCResult::Type::NUM, "height", "height of the block holding the chunk"},
+            {RPCResult::Type::NUM, "block_first", "position of that block's first chunk"},
+            {RPCResult::Type::ARR, "partners", "partner positions", {{RPCResult::Type::NUM, "", ""}}},
+            {RPCResult::Type::STR_HEX, "raw", "the raw chunk"},
+            {RPCResult::Type::STR_HEX, "packed", "the packed chunk"},
+            {RPCResult::Type::STR_HEX, "stored", /*optional=*/true, "the packed store's chunk (with -ddpowpackedstore and the default partner count)"},
+        }},
+        RPCExamples{HelpExampleCli("getddpowchunk", "\"blockhash\" 0")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const bool store_on{gArgs.GetBoolArg("-ddpowpackedstore", false) && request.params[2].isNull()};
+    ddpow::Stage stage{DdpowStageOn(chainman, ParseHashV(request.params[0], "blockhash"), nullptr, store_on)};
+    const uint64_t position{request.params[1].getInt<uint64_t>()};
+    const unsigned m{DdpowPartnersArg(chainman, request.params[2])};
+    uint64_t first;
+    uint256 id;
+    if (!stage.reader.Locate(position, first, id)) throw JSONRPCError(RPC_INVALID_PARAMETER, "position out of range");
+    ddpow::Chunk raw, packed;
+    if (!stage.reader.ReadRaw(position, raw) || !ddpow::ReadPacked(stage.reader, position, m, packed)) {
+        throw JSONRPCError(RPC_MISC_ERROR, "A chunk read from the block files failed");
+    }
+    int height;
+    {
+        LOCK(cs_main);
+        height = Assert(chainman.m_blockman.LookupBlockIndex(id))->nHeight;
+    }
+    UniValue partners(UniValue::VARR);
+    for (const uint64_t p : ddpow::Partners(id, uint32_t(position - first), first, m)) partners.push_back(p);
+    UniValue out(UniValue::VOBJ);
+    out.pushKV("count", stage.reader.Count());
+    out.pushKV("parent_start", stage.parent_start);
+    out.pushKV("height", height);
+    out.pushKV("block_first", first);
+    out.pushKV("partners", std::move(partners));
+    out.pushKV("raw", HexOf(raw));
+    out.pushKV("packed", HexOf(packed));
+    if (stage.packed) {
+        ddpow::Chunk stored;
+        if (!stage.packed->ReadRaw(position, stored)) throw JSONRPCError(RPC_MISC_ERROR, "A read from the packed store failed");
+        out.pushKV("stored", HexOf(stored));
+    }
+    return out;
+},
+    };
+}
+
+static RPCHelpMan getddpowfinal()
+{
+    return RPCHelpMan{"getddpowfinal",
+        "\nThe final digest of a stage-3 digest's walk on a parent block, read from this node's block files.\n",
+        {
+            {"prevblockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the parent block"},
+            {"hash2", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the stage-3 digest, 32 bytes in digest byte order"},
+            {"partners", RPCArg::Type::NUM, RPCArg::DefaultHint{"the consensus value"}, "partner count"},
+        },
+        RPCResult{RPCResult::Type::STR_HEX, "", "the final digest, in digest byte order"},
+        RPCExamples{HelpExampleCli("getddpowfinal", "\"prevblockhash\" \"hash2\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    ddpow::Stage stage{DdpowStageOn(chainman, ParseHashV(request.params[0], "prevblockhash"))};
+    stage.partners = DdpowPartnersArg(chainman, request.params[2]);
+    const auto bytes{ParseHex(request.params[1].get_str())};
+    if (bytes.size() != 32) throw JSONRPCError(RPC_INVALID_PARAMETER, "hash2 must be 32 bytes of hex");
+    uint256 final_digest;
+    if (!stage.Final(uint256{bytes}, final_digest)) throw JSONRPCError(RPC_MISC_ERROR, "A chunk read from the block files failed");
+    return HexStr(final_digest);
+},
+    };
+}
+
+static RPCHelpMan getddpowstats()
+{
+    return RPCHelpMan{"getddpowstats",
+        "\nCounters of the data-dependent proof of work since start or the last reset.\n",
+        {{"reset", RPCArg::Type::BOOL, RPCArg::Default{false}, "reset the counters after reading them"}},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "raw_reads", "raw chunk reads from the block files"},
+            {RPCResult::Type::NUM, "packed_reads", "packed chunks formed"},
+            {RPCResult::Type::NUM, "walks", "walks run"},
+            {RPCResult::Type::NUM, "walk_seconds", "time spent in walks"},
+        }},
+        RPCExamples{HelpExampleCli("getddpowstats", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ddpow::Stats& stats{ddpow::GetStats()};
+    const bool reset{!request.params[0].isNull() && request.params[0].get_bool()};
+    UniValue out(UniValue::VOBJ);
+    out.pushKV("raw_reads", reset ? stats.raw_reads.exchange(0) : stats.raw_reads.load());
+    out.pushKV("packed_reads", reset ? stats.packed_reads.exchange(0) : stats.packed_reads.load());
+    out.pushKV("walks", reset ? stats.walks.exchange(0) : stats.walks.load());
+    out.pushKV("walk_seconds", double(reset ? stats.walk_ns.exchange(0) : stats.walk_ns.load()) / 1e9);
+    return out;
+},
+    };
+}
+
+static RPCHelpMan ddpowbench()
+{
+    return RPCHelpMan{"ddpowbench",
+        "\nRuns walks with pseudo-random stage-3 digests on a parent block and times them (measurement only).\n",
+        {
+            {"prevblockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the parent block"},
+            {"walks", RPCArg::Type::NUM, RPCArg::Optional::NO, "walks to run"},
+            {"partners", RPCArg::Type::NUM, RPCArg::DefaultHint{"the consensus value"}, "partner count"},
+            {"store", RPCArg::Type::BOOL, RPCArg::Default{false}, "read stored packed chunks from the packed store (-ddpowpackedstore; consensus partner count)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "walks", ""},
+            {RPCResult::Type::NUM, "partners", ""},
+            {RPCResult::Type::NUM, "reads", "packed reads per walk (k)"},
+            {RPCResult::Type::NUM, "count", "chunks of the space"},
+            {RPCResult::Type::NUM, "raw_reads", "raw chunk reads in total"},
+            {RPCResult::Type::NUM, "stored_reads", "packed store reads in total"},
+            {RPCResult::Type::NUM, "seconds", "wall time"},
+        }},
+        RPCExamples{HelpExampleCli("ddpowbench", "\"prevblockhash\" 1000")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const bool use_store{!request.params[3].isNull() && request.params[3].get_bool()};
+    ddpow::Stage stage{DdpowStageOn(chainman, ParseHashV(request.params[0], "prevblockhash"), nullptr, use_store)};
+    const uint64_t walks{request.params[1].getInt<uint64_t>()};
+    stage.partners = DdpowPartnersArg(chainman, request.params[2]);
+    if (use_store && stage.partners != chainman.GetConsensus().DdpowPartners) throw JSONRPCError(RPC_INVALID_PARAMETER, "the packed store holds chunks packed with the consensus partner count");
+    ddpow::Stats& stats{ddpow::GetStats()};
+    const uint64_t raw_before{stats.raw_reads.load()};
+    const uint64_t stored_before{stats.stored_reads.load()};
+    const auto start{std::chrono::steady_clock::now()};
+    for (uint64_t i = 0; i < walks; ++i) {
+        uint256 final_digest;
+        if (!stage.Final((HashWriter{} << i).GetSHA256(), final_digest)) throw JSONRPCError(RPC_MISC_ERROR, "A chunk read from the block files failed");
+    }
+    const double seconds{std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()};
+    UniValue out(UniValue::VOBJ);
+    out.pushKV("walks", walks);
+    out.pushKV("partners", stage.partners);
+    out.pushKV("reads", stage.reads);
+    out.pushKV("count", stage.reader.Count());
+    out.pushKV("raw_reads", stats.raw_reads.load() - raw_before);
+    out.pushKV("stored_reads", stats.stored_reads.load() - stored_before);
+    out.pushKV("seconds", seconds);
+    return out;
+},
+    };
+}
+
+static RPCHelpMan getddpowstore()
+{
+    return RPCHelpMan{"getddpowstore",
+        "\nBrings the packed store (-ddpowpackedstore) to the active chain's tip, packing the blocks it lacks, and reports it.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "blocks", "blocks in the store"},
+            {RPCResult::Type::NUM, "chunks", "packed chunks in the store"},
+            {RPCResult::Type::NUM, "bytes", "bytes of packed chunks"},
+            {RPCResult::Type::NUM, "blocks_packed", "blocks packed since start"},
+            {RPCResult::Type::NUM, "raw_reads", "raw chunk reads for packing since start"},
+            {RPCResult::Type::NUM, "packing_seconds", "time spent packing since start"},
+            {RPCResult::Type::NUM, "blocks_dropped", "blocks dropped from the store by reorganizations since start"},
+        }},
+        RPCExamples{HelpExampleCli("getddpowstore", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    if (!gArgs.GetBoolArg("-ddpowpackedstore", false)) throw JSONRPCError(RPC_MISC_ERROR, "The packed store is off (-ddpowpackedstore)");
+    LOCK(cs_main);
+    if (!ddpow::NodeState().SyncTo(chainman.m_blockman, chainman.ActiveChain().Tip())) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Block data for the data-dependent proof of work is unavailable");
+    }
+    (void)DdpowStoreSnapshot(chainman.GetConsensus());
+    const ddpow::PackedStore& store{ddpow::NodePackedStore()};
+    const auto& totals{store.GetTotals()};
+    UniValue out(UniValue::VOBJ);
+    out.pushKV("blocks", uint64_t(store.Blocks()));
+    out.pushKV("chunks", store.Count());
+    out.pushKV("bytes", store.Count() * ddpow::CHUNK);
+    out.pushKV("blocks_packed", totals.blocks_packed);
+    out.pushKV("raw_reads", totals.raw_reads);
+    out.pushKV("packing_seconds", totals.seconds);
+    out.pushKV("blocks_dropped", totals.blocks_dropped);
+    return out;
+},
+    };
+}
+
+static RPCHelpMan ddpowpack()
+{
+    return RPCHelpMan{"ddpowpack",
+        "\nForms every packed chunk of a block (in the space of the chain through it) and times it (measurement only).\n",
+        {
+            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "the block"},
+            {"partners", RPCArg::Type::NUM, RPCArg::DefaultHint{"the consensus value"}, "partner count"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "chunks", "the block's chunks"},
+            {RPCResult::Type::NUM, "partners", ""},
+            {RPCResult::Type::NUM, "raw_reads", "raw chunk reads in total"},
+            {RPCResult::Type::NUM, "seconds", "wall time"},
+        }},
+        RPCExamples{HelpExampleCli("ddpowpack", "\"blockhash\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    ddpow::Stage stage{DdpowStageOn(chainman, ParseHashV(request.params[0], "blockhash"))};
+    const unsigned m{DdpowPartnersArg(chainman, request.params[1])};
+    const uint64_t end{stage.reader.Count()};
+    const uint64_t begin{stage.reader.Blocks() >= 2 ? stage.reader.CountAfter(stage.reader.Blocks() - 2) : 0};
+    ddpow::Stats& stats{ddpow::GetStats()};
+    const uint64_t raw_before{stats.raw_reads.load()};
+    const auto start{std::chrono::steady_clock::now()};
+    ddpow::Chunk packed;
+    for (uint64_t p = begin; p < end; ++p) {
+        if (!ddpow::ReadPacked(stage.reader, p, m, packed)) throw JSONRPCError(RPC_MISC_ERROR, "A chunk read from the block files failed");
+    }
+    const double seconds{std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()};
+    UniValue out(UniValue::VOBJ);
+    out.pushKV("chunks", end - begin);
+    out.pushKV("partners", m);
+    out.pushKV("raw_reads", stats.raw_reads.load() - raw_before);
+    out.pushKV("seconds", seconds);
+    return out;
+},
+    };
+}
+
 void RegisterMiningRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
+        {"mining", &getddpowchunk},
+        {"mining", &getddpowfinal},
+        {"mining", &getddpowstats},
+        {"mining", &ddpowbench},
+        {"mining", &ddpowpack},
+        {"mining", &getddpowstore},
         {"mining", &getnetworkhashps},
         {"mining", &getmininginfo},
         {"mining", &prioritisetransaction},

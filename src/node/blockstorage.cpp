@@ -177,7 +177,9 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                // Data-dependent proof of work: the block hash is not compared with the target;
+                // the walk was checked when the header or block was accepted (BLOCK_OPT_DDPOW).
+                if (!consensusParams.IsDdpowHeight(pindexNew->nHeight) && !CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
                     LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
                     return false;
                 }
@@ -1167,8 +1169,9 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
     const auto block_hash{block.GetHash()};
 
-    // Check the header
-    if (!CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
+    // Check the header (under the data-dependent proof of work the block hash is not compared
+    // with the target)
+    if (!(block.m_header_v2 && GetConsensus().IsDdpowHeight(block.m_height)) && !CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
         LogError("%s: Errors in block header at %s\n", __func__, pos.ToString());
         return false;
     }

@@ -14,6 +14,7 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
+#include <ddpow.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -2769,7 +2770,7 @@ static bool ContextualCheckBlockHeaderVolatile(const CBlockHeader& block, BlockV
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                               CCoinsViewCache& view, bool fJustCheck)
+                               CCoinsViewCache& view, bool fJustCheck, bool fCheckDdpow)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -3006,6 +3007,23 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                  tx_state.GetRejectReason(),
                                  tx_state.GetDebugMessage() + " in generation tx " + block.vtx[0]->GetHash().ToString());
+        }
+    }
+
+    // Data-dependent proof of work: the target check reads chunks of every block before this
+    // one, so it runs here unless the header check already ran it from this node's files.
+    if (fCheckDdpow && block.m_header_v2 && consensusParams.IsDdpowHeight(pindex->nHeight) && !(pindex->nStatus & BLOCK_OPT_DDPOW)) {
+        const auto valid{ddpow::CheckHeader(block, pindex->pprev, m_blockman, consensusParams)};
+        if (!valid) {
+            LogError("%s: data-dependent proof of work: block data before %s is unavailable\n", __func__, pindex->pprev->GetBlockHash().ToString());
+            return FatalError(m_chainman.GetNotifications(), state, _("Block data for the data-dependent proof of work is unavailable."));
+        }
+        if (!*valid) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-ddpow-target", "data-dependent proof of work failed");
+        }
+        if (!fJustCheck) {
+            pindex->nStatus |= BLOCK_OPT_DDPOW;
+            m_blockman.m_dirty_blockindex.insert(pindex);
         }
     }
 
@@ -4438,8 +4456,11 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
             /*debug_message=*/"THIS SHOULD BE IMPOSSIBLE, PLEASE REPORT IT");
     }
 
-    // Check proof of work matches claimed amount
-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
+    // Check proof of work matches claimed amount. Under the data-dependent proof of work a
+    // header alone cannot be checked: the walk reads every ancestor's data (AcceptBlockHeader,
+    // ConnectBlock).
+    if (fCheckPOW && !(block.m_header_v2 && consensusParams.IsDdpowHeight(block.m_height))
+        && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
 
     return true;
@@ -4649,8 +4670,11 @@ std::vector<unsigned char> ChainstateManager::GenerateCoinbaseCommitment(CBlock&
 
 bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams)
 {
-    return std::all_of(headers.cbegin(), headers.cend(),
-            [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams);});
+    return std::all_of(headers.cbegin(), headers.cend(), [&](const auto& header) {
+        // Data-dependent proof of work: not checkable from the header alone.
+        if (header.m_header_v2 && consensusParams.IsDdpowHeight(header.m_height)) return true;
+        return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams);
+    });
 }
 
 bool IsBlockMutated(const CBlock& block, bool check_witness_root)
@@ -4979,7 +5003,23 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
         LogDebug(BCLog::VALIDATION, "%s: not adding new block header %s, missing anti-dos proof-of-work validation\n", __func__, hash.ToString());
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
     }
+    // Data-dependent proof of work: checked in full here when every ancestor's data is held;
+    // otherwise the header is stored unchecked and the block is checked when it connects
+    // (regtest prototype: no proof sections, so a header's work is unproven until then).
+    bool ddpow_checked{false};
+    if (hash != GetConsensus().hashGenesisBlock && block.m_header_v2 && GetConsensus().IsDdpowHeight(block.m_height)) {
+        const auto valid{ddpow::CheckHeader(block, m_blockman.LookupBlockIndex(block.hashPrevBlock), m_blockman, GetConsensus())};
+        if (valid && !*valid) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-ddpow-target", "data-dependent proof of work failed");
+        }
+        if (!valid) LogDebug(BCLog::VALIDATION, "%s: header %s stored unchecked: ancestor data unavailable\n", __func__, hash.ToString());
+        ddpow_checked = valid.has_value();
+    }
     CBlockIndex* pindex{m_blockman.AddToBlockIndex(block, m_best_header)};
+    if (ddpow_checked) {
+        pindex->nStatus |= BLOCK_OPT_DDPOW;
+        m_blockman.m_dirty_blockindex.insert(pindex);
+    }
 
     if (ppindex)
         *ppindex = pindex;
@@ -5256,7 +5296,7 @@ bool TestBlockValidity(BlockValidationState& state,
         LogError("%s: Consensus::ContextualCheckBlock: %s\n", __func__, state.ToString());
         return false;
     }
-    if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, true)) {
+    if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, true, fCheckPOW)) {
         return false;
     }
     assert(state.IsValid());

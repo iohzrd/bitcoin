@@ -29,8 +29,9 @@ enum BuriedDeployment : int16_t {
     DEPLOYMENT_CSV,
     DEPLOYMENT_SEGWIT,
     DEPLOYMENT_BLAKE2B,
+    DEPLOYMENT_DDPOW, // Data-dependent proof of work (regtest prototype)
 };
-constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_BLAKE2B; }
+constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_DDPOW; }
 
 enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
@@ -138,6 +139,14 @@ struct Params {
     /** Block height at which BLAKE2b hardfork becomes active */
     int Blake2bHeight{std::numeric_limits<int>::max()};
     std::vector<unsigned char> Blake2bHeadline;
+    /** Data-dependent proof of work (ddpow.h): active from this height. */
+    int DdpowHeight{std::numeric_limits<int>::max()};
+    /** Packed-chunk reads per attempt (k): the first in the parent block, the rest in the whole chain. */
+    uint8_t DdpowReads{8};
+    /** Raw chunks of older blocks XORed into each chunk (packing); 0 hashes chunks as read. */
+    uint8_t DdpowPartners{7};
+    /** Regtest only: if nonzero, blocks at ddpow heights have the fixed target 2^(256 - bits) - 1. */
+    uint8_t DdpowBlockBits{0};
     uint8_t Blake2bTargetShift{20};
     /**
      * RDTS (BIP110 ReducedData Temporary Softfork) deployment expiry.
@@ -216,6 +225,8 @@ struct Params {
             return SegwitHeight;
         case DEPLOYMENT_BLAKE2B:
             return Blake2bHeight;
+        case DEPLOYMENT_DDPOW:
+            return DdpowHeight;
         } // no default case, so the compiler can warn about missing cases
         return std::numeric_limits<int>::max();
     }
@@ -223,6 +234,11 @@ struct Params {
     bool IsBlake2bHeight(int height) const
     {
         return height >= Blake2bHeight;
+    }
+
+    bool IsDdpowHeight(int height) const
+    {
+        return height >= DdpowHeight;
     }
 
     /** RDTS activates at the BLAKE2b hardfork; there is no separate schedule. */

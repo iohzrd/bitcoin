@@ -174,6 +174,10 @@ public:
         std::optional<int> coinbase_maturity_long_start_height{};
         std::optional<int> coinbase_maturity_long_enforce_height{};
         std::optional<int> coinbase_maturity_long_release_height{};
+        //! Data-dependent proof of work (see -ddpowreads, -ddpowpartners, -ddpowblockbits).
+        std::optional<uint8_t> ddpow_reads{};
+        std::optional<uint8_t> ddpow_partners{};
+        std::optional<uint8_t> ddpow_block_bits{};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);

@@ -19,6 +19,13 @@ uint256 CBlockHeader::GetHash() const
     }
 
     // BLAKE2b
+    const PowStages stages{GetPowStages()};
+    return MaskAndReverse(stages.hash2, stages.mask);
+}
+
+CBlockHeader::PowStages CBlockHeader::GetPowStages() const
+{
+    Assert(m_header_v2);
 
     static constexpr uint128 zeros{};
 
@@ -95,12 +102,16 @@ uint256 CBlockHeader::GetHash() const
 
     Assert(0 == blake2b_nokey((void*)hash.begin(), hash.size(), (void*)ss.data(), ss.size()));
 
+    return PowStages{hash, xor_key_mask};
+}
+
+uint256 CBlockHeader::MaskAndReverse(const uint256& digest, const uint256& mask)
+{
     uint256 final_hash;
     auto out = final_hash.end();
-    for (size_t i = 0; i < hash.size(); ++i) {
-        *--out = hash.begin()[i] ^ xor_key_mask.begin()[i];
+    for (size_t i = 0; i < digest.size(); ++i) {
+        *--out = digest.begin()[i] ^ mask.begin()[i];
     }
-
     return final_hash;
 }
 

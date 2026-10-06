@@ -134,6 +134,8 @@ enum BlockStatus : uint32_t {
 
     BLOCK_STATUS_RESERVED    =   256, //!< Unused flag that was previously set on assumeutxo snapshot blocks and their
                                       //!< ancestors before they were validated, and unset when they were validated.
+
+    BLOCK_OPT_DDPOW          =   512, //!< the data-dependent proof of work was checked from this node's block files
 };
 
 /** The block chain is a tree shaped structure starting with the
